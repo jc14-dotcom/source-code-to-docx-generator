@@ -1,0 +1,10 @@
+# Python caches and generated runtime files
+__pycache__/
+*.py[cod]
+*.log
+
+# Local improvement plans and working notes
+improvement-plan/
+
+# Generated documentation output
+*.docx
