@@ -12,7 +12,7 @@ except ImportError:
 from scanner import ProjectScanner
 from document_generator import DocumentGenerator
 from framework_profiles import ALL_PROFILES, FrameworkProfile
-from framework_detector import detect_framework
+from framework_detector import detect_framework_details
 from logger_setup import setup_logging
 
 
@@ -183,9 +183,12 @@ def main() -> None:
         profile = get_framework(args.framework)
         print(f"  Framework: {profile.name} (from CLI)")
     else:
-        profile = detect_framework(project_root)
-        if profile:
-            print(f"  Auto-detected: {profile.name}")
+        detection = detect_framework_details(project_root)
+        if detection:
+            profile = detection.profile
+            evidence = ", ".join(detection.evidence)
+            print(f"  Auto-detected: {profile.name} ({detection.confidence:.0%} confidence)")
+            print(f"  Evidence: {evidence}")
         else:
             print("  Could not auto-detect. Please select:")
             if tk is not None:
@@ -205,6 +208,8 @@ def main() -> None:
     scan_result = scanner.scan()
     print(f"  Found {scan_result.total_files} files in {scan_result.total_folders} folders")
     print(f"  Skipped {scan_result.skipped_files} files")
+    for reason, count in sorted(scan_result.skipped_reasons.items()):
+        print(f"    - {reason}: {count}")
 
     if scan_result.errors:
         print(f"  {len(scan_result.errors)} errors encountered (see log)")
@@ -214,7 +219,7 @@ def main() -> None:
     output_path = project_root / output_name
 
     generator = DocumentGenerator()
-    generator.generate(scan_result, project_root, output_path, profile, system_name)
+    generator.generate(scan_result, output_path, profile, system_name)
 
     elapsed = time.time() - start_time
 

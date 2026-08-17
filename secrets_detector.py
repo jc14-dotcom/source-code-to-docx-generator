@@ -13,9 +13,18 @@ class SecretDetector:
     def scan_and_redact(self, content: str) -> Tuple[str, int]:
         total_redactions = 0
         result = content
-        for label, pattern in self._compiled.items():
-            matches = pattern.findall(result)
+        for _label, pattern in self._compiled.items():
+            matches = list(pattern.finditer(result))
             if matches:
                 total_redactions += len(matches)
                 result = pattern.sub("[REDACTED]", result)
         return result, total_redactions
+
+    def find_labels(self, content: str) -> Dict[str, int]:
+        """Return detected secret categories without exposing matched values."""
+        findings: Dict[str, int] = {}
+        for label, pattern in self._compiled.items():
+            count = sum(1 for _ in pattern.finditer(content))
+            if count:
+                findings[label] = count
+        return findings

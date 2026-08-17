@@ -31,11 +31,20 @@ class DocumentStats:
         return self.categories.get(key, 0)
 
 
+@dataclass(frozen=True)
+class ScanIssue:
+    path: str
+    code: str
+    message: str
+
+
 @dataclass
 class ScanResult:
     files: List[FileInfo] = field(default_factory=list)
     total_files: int = 0
     total_folders: int = 0
     skipped_files: int = 0
+    skipped_reasons: Dict[str, int] = field(default_factory=dict)
+    issues: List[ScanIssue] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     stats: DocumentStats = field(default_factory=DocumentStats)

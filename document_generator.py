@@ -1,4 +1,8 @@
+import os
 import logging
+import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -6,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.section import WD_ORIENT
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn, nsdecls
@@ -21,6 +26,37 @@ LINES_PER_PAGE = 56
 FRONT_MATTER_PAGES = 3
 METADATA_LINES = 9
 SEPARATOR_LINES = 2
+SECTION_HEADER_LINES = 2
+SOURCE_CHARS_PER_LINE = 100
+TOC_CHARS_PER_LINE = 78
+
+
+class _PaginationCursor:
+    """Deterministic line-based pagination model used for TOC estimates."""
+
+    def __init__(self, page: int, lines_used: int = 0) -> None:
+        self.page = page
+        self.lines_used = lines_used
+
+    def consume(self, lines: int) -> None:
+        remaining = max(0, lines)
+        while remaining:
+            if self.lines_used == LINES_PER_PAGE:
+                self.page += 1
+                self.lines_used = 0
+
+            available = LINES_PER_PAGE - self.lines_used
+            consumed = min(remaining, available)
+            self.lines_used += consumed
+            remaining -= consumed
+
+            if remaining:
+                self.page += 1
+                self.lines_used = 0
+
+    def explicit_page_break(self) -> None:
+        self.page += 1
+        self.lines_used = 0
 
 
 def _set_cell_shading(cell, color: str) -> None:
@@ -47,7 +83,7 @@ class DocumentGenerator:
         self.doc: Optional[Document] = None
         self.detector = SecretDetector()
         self.total_secrets_redacted = 0
-        self._style_configured = False
+        self._content_cache: Dict[Path, str] = {}
 
     def _setup_document(self) -> None:
         self.doc = Document()
@@ -86,7 +122,13 @@ class DocumentGenerator:
             hs.paragraph_format.space_before = Pt(12)
             hs.paragraph_format.space_after = Pt(6)
 
-        self._style_configured = True
+        code_style = self.doc.styles.add_style("Source Code", WD_STYLE_TYPE.PARAGRAPH)
+        code_style.base_style = self.doc.styles["Normal"]
+        code_style.font.name = "Consolas"
+        code_style.font.size = Pt(9)
+        code_style.paragraph_format.space_before = Pt(0)
+        code_style.paragraph_format.space_after = Pt(0)
+        code_style.paragraph_format.line_spacing = 1.0
 
     def _add_header_footer(self, system_name: str) -> None:
         section = self.doc.sections[0]
@@ -176,14 +218,50 @@ class DocumentGenerator:
         self._add_horizontal_line()
         self._add_metadata_table(info)
 
-        for line in content.split("\n"):
-            p = self.doc.add_paragraph()
-            safe = self._sanitize_xml(line)
-            run = p.add_run(safe)
-            run.font.name = "Consolas"
-            run.font.size = Pt(11)
+        # One paragraph with line breaks is considerably cheaper than creating
+        # one paragraph for every source line. Word still renders the source
+        # line-by-line, while python-docx creates far fewer XML elements.
+        p = self.doc.add_paragraph(style="Source Code")
+        p.paragraph_format.keep_together = False
+        run = p.add_run(self._sanitize_xml(content))
+        run.font.name = "Consolas"
+        run.font.size = Pt(9)
 
         self._add_horizontal_line()
+
+    def _read_file_content(self, info: FileInfo) -> str:
+        """Read a source file once per generation and reuse its content."""
+        if info.path not in self._content_cache:
+            self._content_cache[info.path] = info.path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        return self._content_cache[info.path]
+
+    def _validate_docx_secrets(self, path: Path) -> None:
+        """Fail closed if known secrets remain in the generated DOCX archive."""
+        findings: Dict[str, int] = {}
+
+        with zipfile.ZipFile(path) as archive:
+            for member in archive.namelist():
+                if not (member.startswith("word/") and member.endswith(".xml")):
+                    continue
+
+                try:
+                    root = ET.fromstring(archive.read(member))
+                except ET.ParseError:
+                    continue
+
+                text = "".join(root.itertext())
+                for label, count in self.detector.find_labels(text).items():
+                    findings[label] = findings.get(label, 0) + count
+
+        if findings:
+            categories = ", ".join(sorted(findings))
+            raise ValueError(
+                "Generated DOCX failed the secret safety check "
+                f"({categories}). The output was not published."
+            )
 
     def _add_title_page(self, system_name: str, profile: FrameworkProfile) -> None:
         for _ in range(4):
@@ -285,13 +363,62 @@ class DocumentGenerator:
 
         self.doc.add_page_break()
 
+    @staticmethod
+    def _ceil_div(value: int, divisor: int) -> int:
+        return max(1, (value + divisor - 1) // divisor)
+
+    @classmethod
+    def _estimate_wrapped_lines(cls, content: str) -> int:
+        lines = content.split("\n")
+        return sum(
+            cls._ceil_div(max(1, len(line)), SOURCE_CHARS_PER_LINE)
+            for line in lines
+        )
+
     def _count_file_lines(self, info: FileInfo) -> int:
         try:
-            content = info.path.read_text(encoding="utf-8", errors="replace")
-            code_lines = len(content.split("\n"))
+            content = self._read_file_content(info)
+            code_lines = self._estimate_wrapped_lines(content)
             return METADATA_LINES + code_lines + SEPARATOR_LINES
         except Exception:
             return METADATA_LINES + 10 + SEPARATOR_LINES
+
+    def _toc_specs(
+        self,
+        files_by_part: Dict[str, List[FileInfo]],
+        profile: FrameworkProfile,
+    ) -> List[Tuple[int, str]]:
+        specs: List[Tuple[int, str]] = []
+
+        for part_num, part_title in profile.parts:
+            part_files = files_by_part.get(part_num, [])
+            if not part_files:
+                continue
+
+            specs.append((1, f"PART {part_num} - {part_title}"))
+            sections: Dict[str, List[FileInfo]] = {}
+            for file_info in part_files:
+                sections.setdefault(file_info.section, []).append(file_info)
+            for section_name in sections:
+                if section_name != part_title:
+                    specs.append((2, section_name))
+
+        if files_by_part.get("Appendix"):
+            specs.append((1, "Appendix"))
+
+        return specs
+
+    @staticmethod
+    def _estimate_toc_lines(specs: List[Tuple[int, str]]) -> int:
+        header_lines = 1
+        return header_lines + sum(
+            max(
+                1,
+                (len(text) + (level - 1) * 4 + TOC_CHARS_PER_LINE - 1)
+                // TOC_CHARS_PER_LINE,
+            )
+            for level, text in specs
+        )
 
     def _calculate_toc(
         self,
@@ -299,15 +426,17 @@ class DocumentGenerator:
         profile: FrameworkProfile,
     ) -> List[Tuple[int, str, int]]:
         toc_entries: List[Tuple[int, str, int]] = []
-        current_page = FRONT_MATTER_PAGES + 1
+        specs = self._toc_specs(files_by_part, profile)
+        toc_pages = self._ceil_div(self._estimate_toc_lines(specs), LINES_PER_PAGE)
+        cursor = _PaginationCursor(page=FRONT_MATTER_PAGES + toc_pages)
 
         for part_num, part_title in profile.parts:
             part_files = files_by_part.get(part_num, [])
             if not part_files:
                 continue
 
-            toc_entries.append((1, f"PART {part_num} - {part_title}", current_page))
-            current_page += 1
+            toc_entries.append((1, f"PART {part_num} - {part_title}", cursor.page))
+            cursor.explicit_page_break()
 
             sections: Dict[str, List[FileInfo]] = {}
             for f in part_files:
@@ -315,25 +444,28 @@ class DocumentGenerator:
 
             for section_name, section_files in sections.items():
                 if section_name != part_title:
-                    toc_entries.append((2, section_name, current_page))
+                    toc_entries.append((2, section_name, cursor.page))
+                    cursor.consume(SECTION_HEADER_LINES)
 
-                total_lines = sum(self._count_file_lines(f) for f in section_files)
-                pages_needed = max(1, total_lines // LINES_PER_PAGE)
-                current_page += pages_needed
+                for file_info in section_files:
+                    cursor.consume(self._count_file_lines(file_info))
+
+            cursor.explicit_page_break()
 
         appendix_files = files_by_part.get("Appendix", [])
         if appendix_files:
-            toc_entries.append((1, "Appendix", current_page))
-            current_page += 1
-
-            total_lines = sum(self._count_file_lines(f) for f in appendix_files)
-            pages_needed = max(1, total_lines // LINES_PER_PAGE)
-            current_page += pages_needed
+            toc_entries.append((1, "Appendix", cursor.page))
+            cursor.explicit_page_break()
+            for file_info in appendix_files:
+                cursor.consume(self._count_file_lines(file_info))
 
         return toc_entries
 
     def _add_toc(self, toc_entries: List[Tuple[int, str, int]]) -> None:
-        p = self.doc.add_paragraph("Table of Contents", style="Heading 1")
+        p = self.doc.add_paragraph(
+            "Table of Contents (estimated page numbers)",
+            style="Heading 1",
+        )
         p.paragraph_format.space_after = Pt(18)
 
         if not toc_entries:
@@ -346,8 +478,6 @@ class DocumentGenerator:
             run.font.color.rgb = RGBColor(128, 128, 128)
             self.doc.add_page_break()
             return
-
-        max_label_len = max(len(text) for _, text, _ in toc_entries)
 
         for level, text, page_num in toc_entries:
             indent = "    " * (level - 1)
@@ -417,7 +547,7 @@ class DocumentGenerator:
 
                 for info in section_files:
                     try:
-                        content = info.path.read_text(encoding="utf-8", errors="replace")
+                        content = self._read_file_content(info)
                     except Exception as e:
                         logger.warning(f"Cannot read {info.relative_path}: {e}")
                         scan_result.errors.append(f"Read error: {info.relative_path}: {e}")
@@ -438,7 +568,7 @@ class DocumentGenerator:
             self._add_part_header("App", "Appendix")
             for info in appendix_files:
                 try:
-                    content = info.path.read_text(encoding="utf-8", errors="replace")
+                    content = self._read_file_content(info)
                 except Exception as e:
                     logger.warning(f"Cannot read {info.relative_path}: {e}")
                     continue
@@ -452,13 +582,14 @@ class DocumentGenerator:
     def generate(
         self,
         scan_result: ScanResult,
-        project_root: Path,
         output_path: Path,
         profile: FrameworkProfile,
         system_name: str,
     ) -> None:
         logger.info("Generating document...")
 
+        self.total_secrets_redacted = 0
+        self._content_cache.clear()
         self._setup_document()
         self._setup_styles()
         self._add_header_footer(system_name)
@@ -473,5 +604,25 @@ class DocumentGenerator:
 
         self._write_parts(files_by_part, profile, scan_result)
 
-        self.doc.save(str(output_path))
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save to a temporary file first. This prevents a failed safety check
+        # from replacing an existing document with an unsafe one.
+        temp_fd, temp_name = tempfile.mkstemp(
+            prefix=f".{output_path.stem}-",
+            suffix=output_path.suffix or ".docx",
+            dir=output_path.parent,
+        )
+        os.close(temp_fd)
+        temp_path = Path(temp_name)
+
+        try:
+            self.doc.save(str(temp_path))
+            self._validate_docx_secrets(temp_path)
+            os.replace(temp_path, output_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
         logger.info(f"Document saved: {output_path}")
